@@ -1,0 +1,287 @@
+#Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#SPDX-License-Identifier: MIT-0
+#Permission is hereby granted, free of charge, to any person obtaining a copy of this
+#software and associated documentation files (the "Software"), to deal in the Software
+#without restriction, including without limitation the rights to use, copy, modify,
+#merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+#permit persons to whom the Software is furnished to do so.
+
+#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+#INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+#PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+#HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+#OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+#SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+schemaVersion: '0.3'
+description: Create an AMI from an existing instance then share and optionally copy image to another account. Optionally perform cleanup actions 
+parameters:
+  InstanceId:
+    type: AWS::EC2::Instance::Id
+    description: InstanceId to create ami from (Required)
+  TargetAccountId:
+    type: String
+    description: Account AMI will be shared with and optionally copied into (Required)
+  SSMRole:
+    type: String
+    description: Role which SSM will assume to run this document. Used to assume execution role in other account (Required)
+    default: ''
+  CrossAccountExecutionRole:
+    type: String
+    description: Role which is assumed in other account to perform copy action (Optional)
+    default: ''
+  TargetRegion:
+    type: String
+    description: Region AMI will be copied into (Optional)
+    default: ''
+  CopyAMIAnotherAccount:
+    type: Boolean
+    description: 'Copy AMI to another AWS Account?'
+  TerminateOriginalInstance:
+    type: Boolean
+    description: Terminate original EC2 instance used to create AMI?
+  CleanSourceAccount:
+    type: Boolean
+    description: Delete the AMI and Snapshots in source accout? (Default False)
+    default: false
+  KmsKeyId:
+    type: String
+    default: ''
+    description: KMS Key to use for copying Image in TargetAccountId. If not supplied AWS Managed Key will be used in TargetAccountId (Optional)
+assumeRole: '{{ SSMRole }}'
+variables:
+  TargetImageState:
+    type: String
+    default: pending
+    description: Tracks the state of the image copy in the TargetAccountId
+mainSteps:
+  - name: CreateAMI
+    action: aws:createImage
+    nextStep: ShareAMI
+    isEnd: false
+    inputs:
+      InstanceId: '{{ InstanceId }}'
+      NoReboot: true
+      ImageName: AMI created for '{{ InstanceId }}'
+  - name: ShareAMI
+    action: aws:executeAwsApi
+    nextStep: GetAMISnapshots
+    isEnd: false
+    inputs:
+      Service: ec2
+      Api: ModifyImageAttribute
+      ImageId: '{{ CreateAMI.ImageId }}'
+      LaunchPermission:
+        Add:
+          - UserId: '{{ TargetAccountId }}'
+  - name: GetAMISnapshots
+    action: aws:executeAwsApi
+    nextStep: ForEachSnapshotShare
+    isEnd: false
+    inputs:
+      Service: ec2
+      Api: DescribeImages
+      ImageIds:
+        - '{{ CreateAMI.ImageId }}'
+    outputs:
+      - Type: StringList
+        Name: Snapshots
+        Selector: $.Images[0].BlockDeviceMappings..SnapshotId
+  - name: ForEachSnapshotShare
+    action: aws:loop
+    nextStep: CopyAMIChoice
+    isEnd: false
+    inputs:
+      Iterators: '{{ GetAMISnapshots.Snapshots }}'
+      Steps:
+        - name: ShareSnapshot
+          action: aws:executeAwsApi
+          isEnd: true
+          inputs:
+            Service: ec2
+            Api: ModifySnapshotAttribute
+            SnapshotId: '{{ ForEachSnapshotShare.CurrentIteratorValue }}'
+            Attribute: createVolumePermission
+            OperationType: add
+            UserIds:
+              - '{{ TargetAccountId }}'
+  - name: CopyAMIChoice
+    action: aws:branch
+    inputs:
+      Choices:
+        - NextStep: CopyImage_Script
+          Variable: '{{ CopyAMIAnotherAccount }}'
+          BooleanEquals: true
+      Default: CleanSourceAccountChoice
+  - name: TerminateInstanceChoice
+    action: aws:branch
+    isEnd: true
+    inputs:
+      Choices:
+        - NextStep: TerminateInstance
+          Variable: '{{ TerminateOriginalInstance }}'
+          BooleanEquals: true
+  - name: CopyImage_Script
+    action: aws:executeScript
+    nextStep: CheckImageState
+    isEnd: false
+    inputs:
+      Runtime: python3.8
+      Handler: copy_image
+      Script: |-
+        #This script assumes a role in another account and executes copy-image api call
+        import boto3
+        def copy_image(events,context):
+            #assume role in another account
+            boto_sts=boto3.client('sts')
+            stsresponse = boto_sts.assume_role(
+                RoleArn=events['CrossAccountExecutionRole'],
+                RoleSessionName='copy-image',
+            )
+
+            ec2_assumed_client = boto3.client(
+                'ec2',
+                region_name=events['TargetRegion'],
+                aws_access_key_id = stsresponse["Credentials"]["AccessKeyId"],
+                aws_secret_access_key = stsresponse["Credentials"]["SecretAccessKey"],
+                aws_session_token = stsresponse["Credentials"]["SessionToken"],
+            )
+            if "KmsKeyId" in events:
+                response = ec2_assumed_client.copy_image(
+                    SourceImageId=events['SourceImageId'],
+                    SourceRegion=events['SourceRegion'],
+                    Encrypted=True,
+                    KmsKeyId=events['KmsKeyId'],
+                    Name=events['TargetAMIName'],
+                )
+            else:
+                response = ec2_assumed_client.copy_image(
+                    SourceImageId=events['SourceImageId'],
+                    SourceRegion=events['SourceRegion'],
+                    Encrypted=True,
+                    Name=events['TargetAMIName'],
+                )
+            print(response)
+            return response
+      InputPayload:
+        TargetRegion: '{{ TargetRegion }}'
+        SourceImageId: '{{ CreateAMI.ImageId }}'
+        SourceRegion: '{{ global:REGION }}'
+        CrossAccountExecutionRole: '{{ CrossAccountExecutionRole }}'
+        TargetAMIName: Copy from {{ InstanceId }}
+        KmsKeyId: '{{ KmsKeyId }}'
+    outputs:
+      - Type: String
+        Name: ImageId
+        Selector: $.Payload.ImageId
+  - name: CheckImageState
+    action: aws:loop
+    nextStep: CleanSourceAccountChoice
+    isEnd: false
+    inputs:
+      MaxIterations: 60
+      LoopCondition:
+        Not:
+          Variable: '{{ variable:TargetImageState }}'
+          StringEquals: available
+      Steps:
+        - name: describe_images
+          action: aws:executeScript
+          nextStep: UpdateVariable
+          isEnd: false
+          inputs:
+            Runtime: python3.8
+            Handler: describe_image
+            Script: |-
+              #This script assumes a role in another account and executes describe_images api call
+              import boto3
+              def describe_image(events,context):
+                  #assume role in another account
+                  boto_sts=boto3.client('sts')
+                  stsresponse = boto_sts.assume_role(
+                      RoleArn=events['CrossAccountExecutionRole'],
+                      RoleSessionName='describe-image',
+                  )
+
+                  ec2_assumed_client = boto3.client(
+                      'ec2',
+                      region_name=events['TargetRegion'],
+                      aws_access_key_id = stsresponse["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key = stsresponse["Credentials"]["SecretAccessKey"],
+                      aws_session_token = stsresponse["Credentials"]["SessionToken"],
+                  )
+                  
+                  response = ec2_assumed_client.describe_images(
+                      ImageIds=[events['ImageId']],
+                  )
+                  if len(response['Images']):
+                      print(response['Images'][0]['State'])
+                      return response['Images'][0]['State']
+                  else:
+                      raise "Image not found"
+            InputPayload:
+              ImageId: '{{ CopyImage_Script.ImageId }}'
+              TargetRegion: '{{ TargetRegion }}'
+              CrossAccountExecutionRole: '{{ CrossAccountExecutionRole }}'
+          outputs:
+            - Type: String
+              Name: TargetImageState
+              Selector: $.Payload
+        - name: UpdateVariable
+          action: aws:updateVariable
+          nextStep: Branch
+          isEnd: false
+          inputs:
+            Name: variable:TargetImageState
+            Value: '{{ describe_images.TargetImageState }}'
+        - name: Branch
+          action: aws:branch
+          inputs:
+            Choices:
+              - NextStep: CleanSourceAccountChoice
+                Variable: '{{ variable:TargetImageState }}'
+                StringEquals: available
+            Default: Sleep
+        - name: Sleep
+          action: aws:sleep
+          isEnd: true
+          inputs:
+            Duration: PT1M
+  - name: CleanSourceAccountChoice
+    action: aws:branch
+    inputs:
+      Choices:
+        - NextStep: DeregisterImage
+          Variable: '{{ CleanSourceAccount }}'
+          BooleanEquals: true
+      Default: TerminateInstanceChoice
+  - name: DeregisterImage
+    action: aws:executeAwsApi
+    nextStep: ForEachSnapshotDelete
+    isEnd: false
+    inputs:
+      Service: ec2
+      Api: DeregisterImage
+      ImageId: '{{ CreateAMI.ImageId }}'
+  - name: ForEachSnapshotDelete
+    action: aws:loop
+    nextStep: TerminateInstanceChoice
+    isEnd: false
+    inputs:
+      Iterators: '{{ GetAMISnapshots.Snapshots }}'
+      Steps:
+        - name: DeleteSnapshot
+          action: aws:executeAwsApi
+          isEnd: true
+          inputs:
+            Service: ec2
+            Api: DeleteSnapshot
+            SnapshotId: '{{ ForEachSnapshotDelete.CurrentIteratorValue }}'
+  - name: TerminateInstance
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: ec2
+      Api: TerminateInstances
+      InstanceIds:
+        - '{{ InstanceId }}'
