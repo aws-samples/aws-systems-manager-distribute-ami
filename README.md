@@ -1,6 +1,6 @@
 # Distribute an Amazon Machine Image to another AWS Account using AWS Application Migration Service Post-launch automation
 
-Read the full blog post [Distribute an Amazon Machine Image to another AWS Account using AWS Application Migration Service Post-launch automation](https://aws.amazon.com/blogs/mt/distribute-an-amazon-machine-image-to-another-aws-account-using-aws-application-migration-service-post-launch-automation/) (yet to be published)
+Read the full blog post [Distribute an Amazon Machine Image to another AWS Account using AWS Application Migration Service Post-launch automation](https://aws.amazon.com/blogs/mt/distribute-an-amazon-machine-image-to-another-aws-account-using-aws-application-migration-service-post-launch-automation/)
 
 ## Implementation
 
